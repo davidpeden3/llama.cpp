@@ -422,7 +422,9 @@ static void write_group(
     }
 
     // Create ggml context for sliced tensors
-    size_t ctx_size = (size_t)(n_expert_tensors + 64) * ggml_tensor_overhead() + 4096;
+    // Cast to size_t before addition to prevent int overflow if n_expert_tensors
+    // is near INT_MAX (extremely unlikely with real models, but formally unsound).
+    size_t ctx_size = ((size_t)n_expert_tensors + 64) * ggml_tensor_overhead() + 4096;
     struct ggml_init_params ctx_params = {
         /*.mem_size   =*/ ctx_size,
         /*.mem_buffer =*/ nullptr,
