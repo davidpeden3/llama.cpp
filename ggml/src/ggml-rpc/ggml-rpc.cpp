@@ -1569,20 +1569,29 @@ bool rpc_server::set_tensor_gguf(const rpc_msg_set_tensor_gguf_req & request, rp
 
     const char * tensor_name = request.tensor.name;
 
-    // Build GGUF index on first use
-    if (!gguf_ctx) {
-        struct gguf_init_params gparams = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
-        gguf_ctx.reset(gguf_init_from_file(gguf_path.c_str(), gparams));
+    // Build GGUF index on first use.
+    // Protected by backend_mutex because multiple client threads (spawned via
+    // detached std::thread in the accept loop) share this rpc_server instance
+    // and can call set_tensor_gguf concurrently.  Without the lock, the
+    // check-then-init pattern on gguf_ctx races: two threads can both see
+    // !gguf_ctx as true, both call gguf_init_from_file, and the second reset()
+    // frees the first thread's context while it's still in use.
+    {
+        std::lock_guard<std::mutex> lock(backend_mutex);
         if (!gguf_ctx) {
-            GGML_LOG_ERROR("[%s] failed to parse GGUF file: %s\n", __func__, gguf_path.c_str());
-            gguf_path.clear(); // don't try again
-            return true;
+            struct gguf_init_params gparams = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+            gguf_ctx.reset(gguf_init_from_file(gguf_path.c_str(), gparams));
+            if (!gguf_ctx) {
+                GGML_LOG_ERROR("[%s] failed to parse GGUF file: %s\n", __func__, gguf_path.c_str());
+                gguf_path.clear(); // don't try again
+                return true;
+            }
+            GGML_LOG_INFO("[%s] indexed GGUF file: %s (%" PRId64 " tensors)\n",
+                          __func__, gguf_path.c_str(), gguf_get_n_tensors(gguf_ctx.get()));
         }
-        GGML_LOG_INFO("[%s] indexed GGUF file: %s (%" PRId64 " tensors)\n",
-                      __func__, gguf_path.c_str(), gguf_get_n_tensors(gguf_ctx.get()));
     }
 
-    // Look up tensor in GGUF by name
+    // Look up tensor in GGUF by name (gguf_ctx is immutable after init, safe without lock)
     int64_t tensor_idx = gguf_find_tensor(gguf_ctx.get(), tensor_name);
     if (tensor_idx < 0) {
         LOG_DBG("[%s] tensor '%s' not found in GGUF\n", __func__, tensor_name);
@@ -1591,44 +1600,54 @@ bool rpc_server::set_tensor_gguf(const rpc_msg_set_tensor_gguf_req & request, rp
 
     size_t data_offset = gguf_get_data_offset(gguf_ctx.get()) + gguf_get_tensor_offset(gguf_ctx.get(), tensor_idx);
 
-    // Deserialize the tensor to get the buffer pointer and size
-    struct ggml_init_params params {
-        /*.mem_size   =*/ ggml_tensor_overhead(),
-        /*.mem_buffer =*/ NULL,
-        /*.no_alloc   =*/ true,
-    };
-    ggml_context_ptr ctx_ptr { ggml_init(params) };
-    GGML_ASSERT(ctx_ptr != nullptr);
-    ggml_context * ctx = ctx_ptr.get();
-    ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
-    if (tensor == nullptr || tensor->buffer == nullptr) {
-        GGML_LOG_ERROR("[%s] error deserializing tensor '%s'\n", __func__, tensor_name);
-        return true;
-    }
+    // Read from local GGUF file into a temporary buffer.  File I/O happens
+    // outside the backend_mutex to avoid blocking other threads during disk reads.
+    // Deserialize + tensor_set happen under the lock below.
+    size_t size = 0;
+    std::vector<uint8_t> data;
 
-    size_t size = ggml_nbytes(tensor);
-
-    // Sanitize tensor->data against buffer bounds
+    // Deserialize the tensor (needs backend_mutex because it accesses backend buffer state)
     {
-        const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
-        const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+        std::lock_guard<std::mutex> lock(backend_mutex);
 
-        if (request.tensor.data + request.offset < p0
-         || request.tensor.data + request.offset >= p1
-         || size > (p1 - request.tensor.data - request.offset)) {
-            GGML_LOG_ERROR("[%s] tensor '%s' data out of buffer bounds\n", __func__, tensor_name);
+        struct ggml_init_params params {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_ptr { ggml_init(params) };
+        GGML_ASSERT(ctx_ptr != nullptr);
+        ggml_context * ctx = ctx_ptr.get();
+        ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
+        if (tensor == nullptr || tensor->buffer == nullptr) {
+            GGML_LOG_ERROR("[%s] error deserializing tensor '%s'\n", __func__, tensor_name);
             return true;
         }
-    }
 
-    // Read from local GGUF file
+        size = ggml_nbytes(tensor);
+
+        // Sanitize tensor->data against buffer bounds
+        {
+            const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+            const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+            if (request.tensor.data + request.offset < p0
+             || request.tensor.data + request.offset >= p1
+             || size > (p1 - request.tensor.data - request.offset)) {
+                GGML_LOG_ERROR("[%s] tensor '%s' data out of buffer bounds\n", __func__, tensor_name);
+                return true;
+            }
+        }
+    }
+    // backend_mutex released — do file I/O without holding the lock
+
     std::ifstream ifs(gguf_path, std::ios::binary);
     if (!ifs.is_open()) {
         GGML_LOG_ERROR("[%s] failed to open GGUF file: %s\n", __func__, gguf_path.c_str());
         return true;
     }
 
-    std::vector<uint8_t> data(size);
+    data.resize(size);
     ifs.seekg(data_offset);
     if (!ifs.good()) {
         GGML_LOG_ERROR("[%s] failed to seek to offset %zu in GGUF file\n", __func__, data_offset);
@@ -1641,9 +1660,27 @@ bool rpc_server::set_tensor_gguf(const rpc_msg_set_tensor_gguf_req & request, rp
         return true;
     }
 
-    ggml_backend_tensor_set(tensor, data.data(), request.offset, size);
-    response.result = 1;
+    // Write tensor data to backend (needs lock)
+    {
+        std::lock_guard<std::mutex> lock(backend_mutex);
 
+        struct ggml_init_params params {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_ptr { ggml_init(params) };
+        GGML_ASSERT(ctx_ptr != nullptr);
+        ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
+        if (tensor == nullptr || tensor->buffer == nullptr) {
+            GGML_LOG_ERROR("[%s] error re-deserializing tensor '%s' for write\n", __func__, tensor_name);
+            return true;
+        }
+
+        ggml_backend_tensor_set(tensor, data.data(), request.offset, size);
+    }
+
+    response.result = 1;
     GGML_LOG_INFO("[%s] loaded '%s' (%zu bytes) from local GGUF\n", __func__, tensor_name, size);
     return true;
 }
