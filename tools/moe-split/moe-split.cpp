@@ -518,7 +518,16 @@ static void write_group(
         size_t offset_in = gguf_get_data_offset(ctx_in) + gguf_get_tensor_offset(ctx_in, i_in);
 
         if (is_expert_tensor(name) || is_router_gate(name)) {
-            size_t bytes_per_expert = ggml_nbytes(t_in) / n_expert;
+            size_t tensor_bytes = ggml_nbytes(t_in);
+            // Verify tensor byte size is evenly divisible by n_expert.  If not,
+            // the expert tensor layout is not what we expect (each expert should
+            // own an equal slice), and slicing would produce misaligned reads.
+            if (n_expert > 0 && tensor_bytes % (size_t)n_expert != 0) {
+                fprintf(stderr, "error: tensor '%s' size %zu is not evenly divisible by n_expert=%d"
+                        " — cannot split experts safely\n", name, tensor_bytes, n_expert);
+                exit(1);
+            }
+            size_t bytes_per_expert = tensor_bytes / n_expert;
             size_t total_out_bytes  = (size_t)experts_per_group * bytes_per_expert;
 
             if (contiguous) {
