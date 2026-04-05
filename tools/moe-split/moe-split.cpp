@@ -519,7 +519,20 @@ static void write_group(
         struct ggml_tensor * t_in = ggml_get_tensor(ctx_meta, name);
         size_t offset_in = gguf_get_data_offset(ctx_in) + gguf_get_tensor_offset(ctx_in, i_in);
 
+        // Only split tensors whose last dimension matches n_expert.  The header
+        // phase already skips tensors where ne[expert_dim] != n_expert (e.g.,
+        // ffn_gate_inp.scale on Gemma 4 has shape [2816] not [2816, 128]).
+        // The data phase must apply the same check, otherwise it writes truncated
+        // data while the header declares the original shape, corrupting all
+        // subsequent tensor offsets in the output GGUF.
+        bool is_split_tensor = false;
         if (is_expert_tensor(name) || is_router_gate(name)) {
+            int n_dims_in = ggml_n_dims(t_in);
+            int expert_dim = n_dims_in - 1;
+            is_split_tensor = (t_in->ne[expert_dim] == n_expert);
+        }
+
+        if (is_split_tensor) {
             size_t tensor_bytes = ggml_nbytes(t_in);
             // Verify tensor byte size is evenly divisible by n_expert.  If not,
             // the expert tensor layout is not what we expect (each expert should
