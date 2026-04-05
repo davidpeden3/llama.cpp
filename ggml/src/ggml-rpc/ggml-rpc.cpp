@@ -1541,10 +1541,17 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, hash: %" PRIx64 "\n",
             __func__, (void*)tensor->buffer, tensor->data, request.offset, size, request.hash);
 
-    // sanitize tensor->data
+    // sanitize tensor->data — check for uint64 overflow before pointer arithmetic
     {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+        // Overflow guard: if data + offset wraps around uint64, reject immediately
+        if (request.offset > UINT64_MAX - request.tensor.data) {
+            GGML_LOG_ERROR("[%s] integer overflow: data=0x%" PRIx64 " + offset=%" PRIu64 " wraps\n",
+                           __func__, request.tensor.data, request.offset);
+            return false;
+        }
 
         if (request.tensor.data + request.offset < p0
          || request.tensor.data + request.offset >= p1
@@ -1626,10 +1633,16 @@ bool rpc_server::set_tensor_gguf(const rpc_msg_set_tensor_gguf_req & request, rp
 
         size = ggml_nbytes(tensor);
 
-        // Sanitize tensor->data against buffer bounds
+        // Sanitize tensor->data against buffer bounds — check for uint64 overflow first
         {
             const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
             const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+            if (request.offset > UINT64_MAX - request.tensor.data) {
+                GGML_LOG_ERROR("[%s] integer overflow: data + offset wraps for tensor '%s'\n",
+                               __func__, tensor_name);
+                return true;
+            }
 
             if (request.tensor.data + request.offset < p0
              || request.tensor.data + request.offset >= p1
@@ -1738,10 +1751,16 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     }
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 "\n", __func__, (void*)tensor->buffer, tensor->data, request.offset, request.size);
 
-    // sanitize tensor->data
+    // sanitize tensor->data — check for uint64 overflow before pointer arithmetic
     {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+        if (request.offset > UINT64_MAX - request.tensor.data) {
+            GGML_LOG_ERROR("[%s] integer overflow: data=0x%" PRIx64 " + offset=%" PRIu64 " wraps\n",
+                           __func__, request.tensor.data, request.offset);
+            return false;
+        }
 
         if (request.tensor.data + request.offset < p0 ||
             request.tensor.data + request.offset >= p1 ||
@@ -2094,10 +2113,16 @@ bool rpc_server::push_tensor_to_peer(
             return true;
         }
 
-        // Sanitize source tensor data region
+        // Sanitize source tensor data region — check for uint64 overflow first
         {
             const size_t p0 = (size_t) ggml_backend_buffer_get_base(src_tensor->buffer);
             const size_t p1 = p0 + ggml_backend_buffer_get_size(src_tensor->buffer);
+
+            if (request.offset > UINT64_MAX - request.src.data) {
+                GGML_LOG_ERROR("[%s] integer overflow: src.data=0x%" PRIx64 " + offset=%" PRIu64 " wraps\n",
+                               __func__, request.src.data, request.offset);
+                return true;
+            }
 
             if (request.src.data + request.offset < p0 ||
                 request.src.data + request.offset >= p1 ||
