@@ -1999,6 +1999,18 @@ bool rpc_server::push_tensor_to_peer(
 
     response.result = 0;  // default to failure
 
+    // Validate request.size before allocating: reject unreasonable sizes to prevent
+    // OOM from a malicious or buggy client sending a crafted uint64_t.  4 GB is far
+    // beyond any single tensor transfer in practice (largest MoE expert tensors are
+    // ~200 MB).  The bounds check below will catch legitimate size mismatches, but
+    // this early cap prevents the allocation from even being attempted.
+    static constexpr uint64_t MAX_TENSOR_TRANSFER_BYTES = UINT64_C(4) * 1024 * 1024 * 1024;
+    if (request.size == 0 || request.size > MAX_TENSOR_TRANSFER_BYTES) {
+        GGML_LOG_ERROR("[%s] request.size=%" PRIu64 " is zero or exceeds %" PRIu64 " byte safety cap\n",
+                       __func__, request.size, MAX_TENSOR_TRANSFER_BYTES);
+        return true;
+    }
+
     // --- Phase A: Read from local backend (LOCKED) ---
     std::vector<uint8_t> staging_buffer(request.size);
     {
