@@ -1978,13 +1978,33 @@ bool rpc_server::register_peer(const rpc_msg_register_peer_req & request,
         return true;
     }
 
+    // Cap the number of registered peers to prevent unbounded growth from a
+    // malicious client.  In practice, meshes have 2-8 nodes.  A limit of 64
+    // is generous while preventing abuse.  This also limits the SSRF surface:
+    // each registered peer is an endpoint this server will connect to on
+    // PUSH_TENSOR_TO_PEER, so capping peers caps outbound connection targets.
+    static constexpr size_t MAX_PEERS = 64;
+    if (peers.find(request.peer_id) == peers.end() && peers.size() >= MAX_PEERS) {
+        GGML_LOG_ERROR("[%s] peer registry full (%zu peers), rejecting peer_id=%u endpoint='%s'\n",
+                       __func__, peers.size(), request.peer_id, endpoint.c_str());
+        response.result = 0;
+        return true;
+    }
+
+    // Log at WARN level because peer registration causes this server to make
+    // outbound TCP connections to the registered endpoint on future
+    // PUSH_TENSOR_TO_PEER commands (SSRF surface).  On a private network this
+    // is expected, but the log makes it auditable.
+    GGML_LOG_WARN("[%s] registering peer_id=%u endpoint='%s' (server will connect to this address on tensor push)\n",
+                  __func__, request.peer_id, endpoint.c_str());
+
     peer_info info;
     info.endpoint = endpoint;
     info.sock = nullptr;  // lazy connect in Phase 5
 
+    std::lock_guard<std::mutex> lock(backend_mutex);
     peers[request.peer_id] = std::move(info);
 
-    LOG_DBG("[%s] registered peer_id=%u endpoint='%s'\n", __func__, request.peer_id, endpoint.c_str());
     response.result = 1;
     return true;
 }
