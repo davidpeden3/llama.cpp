@@ -950,17 +950,30 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             static std::mutex cache_mutex;
             static std::unordered_map<uint64_t, size_t> alloc_size_cache;
 
-            // Build a cache key from the fields that determine alloc_size
+            // Build a cache key from the fields that determine alloc_size.
+            // Use chained hashing (feed each FNV output as the seed for the next)
+            // instead of XOR.  XOR is commutative: h(A) ^ h(B) == h(B) ^ h(A), so
+            // different orderings of src tensor types/dims can collide.  Chaining
+            // preserves order sensitivity and produces better distribution.
+            auto chain_hash = [](uint64_t seed, const uint8_t * data, size_t len) -> uint64_t {
+                // FNV-1a with custom seed instead of the standard offset basis
+                uint64_t h = seed;
+                for (size_t i = 0; i < len; i++) {
+                    h ^= data[i];
+                    h *= UINT64_C(0x100000001b3);  // FNV prime
+                }
+                return h;
+            };
             uint64_t key = fnv_hash((const uint8_t *)&request.tensor.type, sizeof(request.tensor.type));
-            key ^= fnv_hash((const uint8_t *)request.tensor.ne, sizeof(request.tensor.ne));
-            key ^= fnv_hash((const uint8_t *)&request.tensor.op, sizeof(request.tensor.op));
+            key = chain_hash(key, (const uint8_t *)request.tensor.ne, sizeof(request.tensor.ne));
+            key = chain_hash(key, (const uint8_t *)&request.tensor.op, sizeof(request.tensor.op));
             for (int i = 0; i < GGML_MAX_SRC; i++) {
                 if (request.srcs[i].id != 0) {
-                    key ^= fnv_hash((const uint8_t *)&request.srcs[i].type, sizeof(request.srcs[i].type));
-                    key ^= fnv_hash((const uint8_t *)request.srcs[i].ne, sizeof(request.srcs[i].ne));
+                    key = chain_hash(key, (const uint8_t *)&request.srcs[i].type, sizeof(request.srcs[i].type));
+                    key = chain_hash(key, (const uint8_t *)request.srcs[i].ne, sizeof(request.srcs[i].ne));
                 }
             }
-            key ^= fnv_hash((const uint8_t *)&request.device, sizeof(request.device));
+            key = chain_hash(key, (const uint8_t *)&request.device, sizeof(request.device));
 
             std::lock_guard<std::mutex> lock(cache_mutex);
             auto it = alloc_size_cache.find(key);
