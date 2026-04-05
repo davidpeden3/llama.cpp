@@ -139,30 +139,48 @@ static std::vector<std::pair<int,double>> read_ranking_file(const std::string & 
 }
 
 static void parse_args(int argc, const char ** argv, moe_split_params & params) {
+    // Helper: check that flag at position i has a following argument.
+    // Without this, flags like "-m" as the last argument would read past argv.
+    auto require_arg = [&](int i, const char * flag) {
+        if (i + 1 >= argc) {
+            fprintf(stderr, "error: %s requires an argument\n", flag);
+            exit(1);
+        }
+    };
+
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "-h" || arg == "--help") {
             print_usage(argv[0]);
             exit(0);
         } else if (arg == "-m" || arg == "--model") {
+            require_arg(i, arg.c_str());
             params.input = argv[++i];
         } else if (arg == "-g" || arg == "--groups") {
+            require_arg(i, arg.c_str());
             params.n_groups = std::atoi(argv[++i]);
         } else if (arg == "--group-id") {
+            require_arg(i, arg.c_str());
             params.group_id = std::atoi(argv[++i]);
         } else if (arg == "--balanced") {
             params.balanced = true;
         } else if (arg == "--ranking-file") {
+            require_arg(i, arg.c_str());
             params.ranking_file = argv[++i];
         } else if (arg == "--replicate") {
+            require_arg(i, arg.c_str());
             params.replicate = std::atoi(argv[++i]);
         } else if (arg == "--expert-list") {
+            require_arg(i, arg.c_str());
             params.expert_list = parse_int_list(argv[++i]);
         } else if (arg == "--group-map") {
+            require_arg(i, arg.c_str());
             params.group_map_file = argv[++i];
         } else if (arg == "-o" || arg == "--output") {
+            require_arg(i, arg.c_str());
             params.output = argv[++i];
         } else if (arg == "--output-prefix") {
+            require_arg(i, arg.c_str());
             params.output_prefix = argv[++i];
         } else if (arg == "--dry-run") {
             params.dry_run = true;
