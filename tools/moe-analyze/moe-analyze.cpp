@@ -593,7 +593,13 @@ int main(int argc, char ** argv) {
 
     // masked: test each group
     for (int g = 0; g < test_groups; g++) {
-        bool mask[512] = {};
+        // Use dynamically-sized array instead of fixed bool[512] to prevent
+        // stack buffer overflow if a model has n_expert > 512.  Current MoE
+        // models have 64-256 experts, but a crafted GGUF could claim more.
+        // Note: can't use std::vector<bool> because it bit-packs and .data()
+        // doesn't return bool*.  Use a unique_ptr<bool[]> instead.
+        auto mask = std::make_unique<bool[]>(n_expert);
+        std::fill(mask.get(), mask.get() + n_expert, false);
         for (int e = g * test_epg; e < (g + 1) * test_epg && e < n_expert; e++) {
             mask[e] = true;
         }
@@ -603,7 +609,7 @@ int main(int argc, char ** argv) {
 
         llama_model_set_expert_mask(
             const_cast<llama_model *>(llama_get_model(ctx)),
-            mask, n_expert);
+            mask.get(), n_expert);
 
         auto masked_lp = run_generation("group_" + std::to_string(g), 5);
 
