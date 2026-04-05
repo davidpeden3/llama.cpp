@@ -2,12 +2,14 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cpp.h"
+#include "gguf.h"
 
 #include <cinttypes>
 #include <string>
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #ifdef _WIN32
@@ -107,6 +109,10 @@ enum rpc_cmd {
     RPC_CMD_HELLO,
     RPC_CMD_DEVICE_COUNT,
     RPC_CMD_GRAPH_RECOMPUTE,
+    RPC_CMD_SET_TENSOR_GGUF,     // load tensor from server's local GGUF file
+    RPC_CMD_REGISTER_PEER,       // Client tells a server about another server
+    RPC_CMD_PUSH_TENSOR_TO_PEER, // Client tells a server to push tensor data to a peer
+    RPC_CMD_PEER_TENSOR_DATA,    // Server-to-server: incoming tensor data from a peer
     RPC_CMD_COUNT,
 };
 
@@ -220,6 +226,40 @@ struct rpc_msg_graph_recompute_req {
     uint32_t device;
 };
 
+// SET_TENSOR_GGUF: tell the server to load tensor data from its local GGUF file
+// instead of receiving the data over the wire.
+// The server looks up the tensor by name in its pre-loaded GGUF index.
+struct rpc_msg_set_tensor_gguf_req {
+    rpc_tensor tensor;        // tensor metadata (includes name for GGUF lookup)
+    uint64_t   offset;        // offset within the tensor data (for chunked loading, usually 0)
+};
+
+struct rpc_msg_set_tensor_gguf_rsp {
+    uint8_t result;           // 1 = loaded from local GGUF, 0 = tensor not found / no GGUF
+};
+
+// Client → Server: register a peer server
+struct rpc_msg_register_peer_req {
+    uint32_t peer_id;              // client-assigned numeric ID for this peer
+    char     endpoint[128];        // "host:port" of the peer, null-terminated
+};
+
+struct rpc_msg_register_peer_rsp {
+    uint8_t result;                // 1 = success, 0 = failure
+};
+
+// Client → Server A: push tensor data to a peer
+struct rpc_msg_push_tensor_to_peer_req {
+    uint32_t   peer_id;           // which registered peer to push to
+    rpc_tensor src;               // tensor to read from (on this server)
+    rpc_tensor dst;               // tensor to write to (on the peer server)
+    uint64_t   offset;            // byte offset within the tensor data
+    uint64_t   size;              // number of bytes to transfer
+};
+
+struct rpc_msg_push_tensor_to_peer_rsp {
+    uint8_t result;               // 1 = success, 0 = failure
+};
 #pragma pack(pop)
 
 // RPC data structures
@@ -235,7 +275,15 @@ struct ggml_backend_rpc_buffer_type_context {
     std::string name;
     size_t      alignment;
     size_t      max_size;
+    uint32_t    peer_id;               // client-assigned ID for peer registration
+    uint8_t     server_minor_version;  // protocol minor version reported by the server
 };
+
+// Returns true if the server behind this buffer type context supports
+// peer-to-peer commands (REGISTER_PEER, PUSH_TENSOR_TO_PEER, PEER_TENSOR_DATA).
+static bool rpc_server_supports_peers(const ggml_backend_rpc_buffer_type_context * ctx) {
+    return ctx->server_minor_version >= 7;
+}
 
 struct graph_cache {
 
@@ -495,7 +543,21 @@ static bool send_rpc_cmd(const std::shared_ptr<socket_t> & sock, enum rpc_cmd cm
 
 // RPC client-side implementation
 
-static bool check_server_version(const std::shared_ptr<socket_t> & sock) {
+// Global tracking of all RPC server endpoints for peer registration
+struct rpc_server_info {
+    std::string endpoint;
+    uint32_t    peer_id;
+    uint8_t     server_minor_version;
+};
+
+static std::vector<rpc_server_info> rpc_servers;
+static std::mutex                   rpc_servers_mutex;
+
+// Maps endpoint → server minor version, populated during version check
+static std::unordered_map<std::string, uint8_t> rpc_server_minor_versions;
+static std::mutex                               rpc_server_minor_versions_mutex;
+
+static bool check_server_version(const std::shared_ptr<socket_t> & sock, uint8_t * out_minor = nullptr) {
     rpc_msg_hello_rsp response;
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, nullptr, 0, &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
@@ -505,6 +567,9 @@ static bool check_server_version(const std::shared_ptr<socket_t> & sock) {
     }
     if (response.minor != RPC_PROTO_MINOR_VERSION || response.patch != RPC_PROTO_PATCH_VERSION) {
         GGML_LOG_INFO("WARNING: RPC server version mismatch: %d.%d.%d\n", response.major, response.minor, response.patch);
+    }
+    if (out_minor) {
+        *out_minor = response.minor;
     }
     return true;
 }
@@ -543,12 +608,40 @@ static std::shared_ptr<socket_t> get_socket(const std::string & endpoint) {
     if (sock == nullptr) {
         return nullptr;
     }
-    if (!check_server_version(sock)) {
+    uint8_t minor = 0;
+    if (!check_server_version(sock, &minor)) {
         return nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> mv_lock(rpc_server_minor_versions_mutex);
+        rpc_server_minor_versions[endpoint] = minor;
     }
     LOG_DBG("[%s] connected to %s, sockfd=%d\n", __func__, endpoint.c_str(), sock->fd);
     sockets[endpoint] = sock;
     return sock;
+}
+
+// Send RPC_CMD_REGISTER_PEER to the server connected via `sock`.
+// Registers `peer_endpoint` with the given `peer_id`.
+// Returns true on success.
+static bool send_register_peer(const std::shared_ptr<socket_t> & sock,
+                               uint32_t peer_id,
+                               const char * peer_endpoint) {
+    rpc_msg_register_peer_req request = {};
+    request.peer_id = peer_id;
+    strncpy(request.endpoint, peer_endpoint, sizeof(request.endpoint) - 1);
+    request.endpoint[sizeof(request.endpoint) - 1] = '\0';
+
+    rpc_msg_register_peer_rsp response = {};
+    bool ok = send_rpc_cmd(sock, RPC_CMD_REGISTER_PEER,
+                           &request, sizeof(request),
+                           &response, sizeof(response));
+    return ok && response.result == 1;
+}
+
+// Helper to get peer_id from a buffer type context
+static uint32_t get_peer_id(const ggml_backend_rpc_buffer_type_context * ctx) {
+    return ctx->peer_id;
 }
 
 static void ggml_backend_rpc_buffer_free_buffer(ggml_backend_buffer_t buffer) {
@@ -637,6 +730,27 @@ static enum ggml_status ggml_backend_rpc_buffer_init_tensor(ggml_backend_buffer_
 static void ggml_backend_rpc_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
     rpc_tensor rpc_tensor = serialize_tensor(tensor);
+
+    // Try SET_TENSOR_GGUF first: ask the server to load from its local GGUF file.
+    // This avoids transferring weight data over the network entirely.
+    // Only try for tensors that look like GGUF model weights — their names never contain '#'
+    // (which is used by compute graph intermediates like "RPC0[...]#leaf_8#0").
+    // Also skip tiny tensors (activations/inputs) to avoid wasted round-trips.
+    if (rpc_tensor.name[0] != '\0' && offset == 0
+            && strchr(rpc_tensor.name, '#') == nullptr && size > 1024) {
+        rpc_msg_set_tensor_gguf_req gguf_req;
+        gguf_req.tensor = rpc_tensor;
+        gguf_req.offset = offset;
+        rpc_msg_set_tensor_gguf_rsp gguf_rsp;
+        bool status = send_rpc_cmd(ctx->sock, RPC_CMD_SET_TENSOR_GGUF, &gguf_req, sizeof(gguf_req), &gguf_rsp, sizeof(gguf_rsp));
+        RPC_STATUS_ASSERT(status);
+        if (gguf_rsp.result) {
+            // server loaded from local GGUF — no network transfer needed
+            return;
+        }
+        // fall through to hash/transfer path
+    }
+
     if (size > HASH_THRESHOLD) {
         rpc_msg_set_tensor_hash_req request;
         request.tensor = rpc_tensor;
@@ -671,15 +785,15 @@ static void ggml_backend_rpc_buffer_get_tensor(ggml_backend_buffer_t buffer, con
 }
 
 static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
-    if (ggml_backend_buffer_is_rpc(src->buffer)) {
-        // check if src and dst are on the same server
-        ggml_backend_buffer_t src_buffer = src->buffer;
-        ggml_backend_rpc_buffer_context * src_ctx = (ggml_backend_rpc_buffer_context *)src_buffer->context;
-        ggml_backend_buffer_t dst_buffer = dst->buffer;
-        ggml_backend_rpc_buffer_context * dst_ctx = (ggml_backend_rpc_buffer_context *)dst_buffer->context;
-        if (src_ctx->sock != dst_ctx->sock) {
-            return false;
-        }
+    if (!ggml_backend_buffer_is_rpc(src->buffer)) {
+        return false;
+    }
+
+    ggml_backend_rpc_buffer_context * src_ctx = (ggml_backend_rpc_buffer_context *)src->buffer->context;
+    ggml_backend_rpc_buffer_context * dst_ctx = (ggml_backend_rpc_buffer_context *)dst->buffer->context;
+
+    if (src_ctx->sock == dst_ctx->sock) {
+        // Same server: existing server-local copy path
         ggml_backend_rpc_buffer_context * ctx = (ggml_backend_rpc_buffer_context *)buffer->context;
         rpc_msg_copy_tensor_req request;
         request.src = serialize_tensor(src);
@@ -689,7 +803,51 @@ static bool ggml_backend_rpc_buffer_cpy_tensor(ggml_backend_buffer_t buffer, con
         RPC_STATUS_ASSERT(status);
         return response.result;
     }
-    return false;
+
+    // Different servers: attempt direct server-to-server push
+    if (ggml_nbytes(src) != ggml_nbytes(dst)) {
+        return false;
+    }
+
+    // Check that both servers support peer commands (protocol minor >= 7)
+    ggml_backend_rpc_buffer_type_context * src_buft_ctx =
+        (ggml_backend_rpc_buffer_type_context *)src->buffer->buft->context;
+    ggml_backend_rpc_buffer_type_context * dst_buft_ctx =
+        (ggml_backend_rpc_buffer_type_context *)dst->buffer->buft->context;
+
+    if (!rpc_server_supports_peers(src_buft_ctx) || !rpc_server_supports_peers(dst_buft_ctx)) {
+        LOG_DBG("rpc: skipping direct push for tensor %s — "
+                "src server minor=%u, dst server minor=%u (need >= 7)\n",
+                src->name,
+                (unsigned)src_buft_ctx->server_minor_version,
+                (unsigned)dst_buft_ctx->server_minor_version);
+        return false;
+    }
+
+    // Get the peer_id for the destination server from its buffer type context
+    uint32_t peer_id = dst_buft_ctx->peer_id;
+
+    rpc_msg_push_tensor_to_peer_req request;
+    request.peer_id = peer_id;
+    request.src     = serialize_tensor(src);
+    request.dst     = serialize_tensor(dst);
+    request.offset  = 0;
+    request.size    = ggml_nbytes(src);
+
+    rpc_msg_push_tensor_to_peer_rsp response;
+    bool status = send_rpc_cmd(src_ctx->sock, RPC_CMD_PUSH_TENSOR_TO_PEER,
+                               &request, sizeof(request),
+                               &response, sizeof(response));
+
+    if (!status || !response.result) {
+        LOG_DBG("rpc: direct push failed, falling back to client relay for tensor %s\n",
+                src->name);
+        return false;
+    }
+
+    LOG_DBG("rpc: direct push tensor %s (%zu bytes) to peer %u\n",
+            src->name, ggml_nbytes(src), peer_id);
+    return true;
 }
 
 static void ggml_backend_rpc_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
@@ -774,7 +932,6 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
 
     if (rpc_get) {
         ggml_backend_rpc_buffer_type_context * buft_ctx = (ggml_backend_rpc_buffer_type_context *)buft->context;
-        auto sock = get_socket(buft_ctx->endpoint);
 
         rpc_msg_get_alloc_size_req request = {
             /*.device =*/ buft_ctx->device,
@@ -787,12 +944,51 @@ static size_t ggml_backend_rpc_buffer_type_get_alloc_size(ggml_backend_buffer_ty
             request.srcs[i] = serialize_tensor(tensor->src[i]);
         }
 
-        // TODO: cache the alloc responses to avoid extra RPC calls?
-        rpc_msg_get_alloc_size_rsp response;
-        bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
-        RPC_STATUS_ASSERT(status);
+        // Cache alloc_size responses keyed on (type, dims, op, src types+dims) to avoid
+        // repeated RPC round-trips. The result is deterministic for a given tensor configuration.
+        {
+            static std::mutex cache_mutex;
+            static std::unordered_map<uint64_t, size_t> alloc_size_cache;
 
-        return response.alloc_size;
+            // Build a cache key from the fields that determine alloc_size.
+            // Use chained hashing (feed each FNV output as the seed for the next)
+            // instead of XOR.  XOR is commutative: h(A) ^ h(B) == h(B) ^ h(A), so
+            // different orderings of src tensor types/dims can collide.  Chaining
+            // preserves order sensitivity and produces better distribution.
+            auto chain_hash = [](uint64_t seed, const uint8_t * data, size_t len) -> uint64_t {
+                // FNV-1a with custom seed instead of the standard offset basis
+                uint64_t h = seed;
+                for (size_t i = 0; i < len; i++) {
+                    h ^= data[i];
+                    h *= UINT64_C(0x100000001b3);  // FNV prime
+                }
+                return h;
+            };
+            uint64_t key = fnv_hash((const uint8_t *)&request.tensor.type, sizeof(request.tensor.type));
+            key = chain_hash(key, (const uint8_t *)request.tensor.ne, sizeof(request.tensor.ne));
+            key = chain_hash(key, (const uint8_t *)&request.tensor.op, sizeof(request.tensor.op));
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                if (request.srcs[i].id != 0) {
+                    key = chain_hash(key, (const uint8_t *)&request.srcs[i].type, sizeof(request.srcs[i].type));
+                    key = chain_hash(key, (const uint8_t *)request.srcs[i].ne, sizeof(request.srcs[i].ne));
+                }
+            }
+            key = chain_hash(key, (const uint8_t *)&request.device, sizeof(request.device));
+
+            std::lock_guard<std::mutex> lock(cache_mutex);
+            auto it = alloc_size_cache.find(key);
+            if (it != alloc_size_cache.end()) {
+                return it->second;
+            }
+
+            auto sock = get_socket(buft_ctx->endpoint);
+            rpc_msg_get_alloc_size_rsp response;
+            bool status = send_rpc_cmd(sock, RPC_CMD_GET_ALLOC_SIZE, &request, sizeof(request), &response, sizeof(response));
+            RPC_STATUS_ASSERT(status);
+
+            alloc_size_cache[key] = response.alloc_size;
+            return response.alloc_size;
+        }
     }
 
     return ggml_nbytes(tensor);
@@ -922,12 +1118,35 @@ ggml_backend_buffer_type_t ggml_backend_rpc_buffer_type(const char * endpoint, u
     }
     size_t alignment = get_alignment(sock, device);
     size_t max_size = get_max_size(sock, device);
+    // Look up the peer_id and minor version for this endpoint from global server list
+    uint32_t peer_id = 0;
+    uint8_t  minor_ver = 0;
+    {
+        std::lock_guard<std::mutex> srv_lock(rpc_servers_mutex);
+        for (const auto & srv : rpc_servers) {
+            if (srv.endpoint == endpoint) {
+                peer_id   = srv.peer_id;
+                minor_ver = srv.server_minor_version;
+                break;
+            }
+        }
+    }
+    // Fall back to the version map if not found in server list (e.g. first connection)
+    if (minor_ver == 0) {
+        std::lock_guard<std::mutex> mv_lock(rpc_server_minor_versions_mutex);
+        auto mv_it = rpc_server_minor_versions.find(endpoint);
+        if (mv_it != rpc_server_minor_versions.end()) {
+            minor_ver = mv_it->second;
+        }
+    }
     ggml_backend_rpc_buffer_type_context * buft_ctx = new ggml_backend_rpc_buffer_type_context {
-        /* .endpoint  = */ endpoint,
-        /* .device    = */ device,
-        /* .name      = */ buft_name,
-        /* .alignment = */ alignment,
-        /* .max_size  = */ max_size
+        /* .endpoint              = */ endpoint,
+        /* .device                = */ device,
+        /* .name                  = */ buft_name,
+        /* .alignment             = */ alignment,
+        /* .max_size              = */ max_size,
+        /* .peer_id               = */ peer_id,
+        /* .server_minor_version  = */ minor_ver
     };
     auto reg = ggml_backend_rpc_add_server(endpoint);
     ggml_backend_buffer_type_t buft = new ggml_backend_buffer_type {
@@ -1000,6 +1219,7 @@ public:
     bool buffer_clear(const rpc_msg_buffer_clear_req & request);
     bool set_tensor(const std::vector<uint8_t> & input);
     bool set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response);
+    bool set_tensor_gguf(const rpc_msg_set_tensor_gguf_req & request, rpc_msg_set_tensor_gguf_rsp & response);
     bool get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response);
     bool copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response);
     bool graph_compute(const std::vector<uint8_t> & input);
@@ -1007,6 +1227,11 @@ public:
     bool init_tensor(const rpc_msg_init_tensor_req & request);
     bool get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_msg_get_alloc_size_rsp & response);
     bool get_device_memory(const rpc_msg_get_device_memory_req & request, rpc_msg_get_device_memory_rsp & response);
+    bool register_peer(const rpc_msg_register_peer_req & request, rpc_msg_register_peer_rsp & response);
+    bool push_tensor_to_peer(const rpc_msg_push_tensor_to_peer_req & request, rpc_msg_push_tensor_to_peer_rsp & response);
+
+    // Set the local GGUF file path for SET_TENSOR_GGUF
+    void set_gguf_path(const char * path) { gguf_path = path ? path : ""; }
 
     struct stored_graph {
         std::vector<uint8_t>   buffer;
@@ -1016,6 +1241,7 @@ public:
 private:
     bool get_cached_file(uint64_t hash, std::vector<uint8_t> & data);
     ggml_tensor * deserialize_tensor(struct ggml_context * ctx, const rpc_tensor * tensor);
+    socket_t * connect_to_peer(uint32_t peer_id);
     ggml_tensor * create_node(uint64_t id,
                               struct ggml_context * ctx,
                               const std::unordered_map<uint64_t, const rpc_tensor*> & tensor_ptrs,
@@ -1024,9 +1250,24 @@ private:
 
     std::vector<ggml_backend_t> backends;
     const char * cache_dir;
+    std::string  gguf_path;   // local GGUF file for SET_TENSOR_GGUF
+    gguf_context_ptr gguf_ctx; // parsed GGUF index (lazy-initialized)
     std::unordered_set<ggml_backend_buffer_t> buffers;
     // store the last computed graph for each backend
     std::vector<stored_graph> stored_graphs;
+    std::mutex backend_mutex;  // guards all ggml backend API access
+
+public:
+    size_t get_n_backends() const { return backends.size(); }
+
+    // Peer registry: maps client-assigned peer_id to peer info.
+    // Accessed only from the client connection thread (no separate mutex needed).
+    struct peer_info {
+        std::string endpoint;                 // "host:port"
+        std::shared_ptr<socket_t> sock;       // lazily established connection (used in Phase 5)
+    };
+
+    std::unordered_map<uint32_t, peer_info> peers;  // peer_id → info
 };
 
 void rpc_server::hello(rpc_msg_hello_rsp & response) {
@@ -1041,6 +1282,7 @@ bool rpc_server::get_alloc_size(const rpc_msg_get_alloc_size_req & request, rpc_
     if (dev_id >= backends.size()) {
         return false;
     }
+    std::lock_guard<std::mutex> lock(backend_mutex);
     ggml_backend_buffer_type_t buft;
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead()*(1 + GGML_MAX_SRC),
@@ -1081,6 +1323,7 @@ bool rpc_server::alloc_buffer(const rpc_msg_alloc_buffer_req & request, rpc_msg_
     if (dev_id >= backends.size()) {
         return false;
     }
+    std::lock_guard<std::mutex> lock(backend_mutex);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
     ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, request.size);
     response.remote_ptr = 0;
@@ -1102,6 +1345,7 @@ bool rpc_server::get_alignment(const rpc_msg_get_alignment_req & request, rpc_ms
     if (dev_id >= backends.size()) {
         return false;
     }
+    std::lock_guard<std::mutex> lock(backend_mutex);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
     size_t alignment = ggml_backend_buft_get_alignment(buft);
     LOG_DBG("[%s] device: %d, alignment: %lu\n", __func__, dev_id, alignment);
@@ -1114,6 +1358,7 @@ bool rpc_server::get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_
     if (dev_id >= backends.size()) {
         return false;
     }
+    std::lock_guard<std::mutex> lock(backend_mutex);
     ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backends[dev_id]);
     size_t max_size = ggml_backend_buft_get_max_size(buft);
     LOG_DBG("[%s] device: %d, max_size: %lu\n", __func__, dev_id, max_size);
@@ -1123,6 +1368,7 @@ bool rpc_server::get_max_size(const rpc_msg_get_max_size_req & request, rpc_msg_
 
 bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rpc_msg_buffer_get_base_rsp & response) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
+    std::lock_guard<std::mutex> lock(backend_mutex);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
     if (buffers.find(buffer) == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
@@ -1135,6 +1381,7 @@ bool rpc_server::buffer_get_base(const rpc_msg_buffer_get_base_req & request, rp
 
 bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 "\n", __func__, request.remote_ptr);
+    std::lock_guard<std::mutex> lock(backend_mutex);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
     if (buffers.find(buffer) == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
@@ -1147,6 +1394,7 @@ bool rpc_server::free_buffer(const rpc_msg_free_buffer_req & request) {
 
 bool rpc_server::buffer_clear(const rpc_msg_buffer_clear_req & request) {
     LOG_DBG("[%s] remote_ptr: %" PRIx64 ", value: %u\n", __func__, request.remote_ptr, request.value);
+    std::lock_guard<std::mutex> lock(backend_mutex);
     ggml_backend_buffer_t buffer = reinterpret_cast<ggml_backend_buffer_t>(request.remote_ptr);
     if (buffers.find(buffer) == buffers.end()) {
         GGML_LOG_ERROR("[%s] buffer not found\n", __func__);
@@ -1216,6 +1464,7 @@ bool rpc_server::set_tensor(const std::vector<uint8_t> & input) {
     memcpy(&offset, input.data() + sizeof(rpc_tensor), sizeof(offset));
     const size_t size = input.size() - sizeof(rpc_tensor) - sizeof(offset);
 
+    std::lock_guard<std::mutex> lock(backend_mutex);
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1281,11 +1530,14 @@ bool rpc_server::get_cached_file(uint64_t hash, std::vector<uint8_t> & data) {
 bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rpc_msg_set_tensor_hash_rsp & response)
 {
     std::vector<uint8_t> cached_file;
+    // Cache lookup is file I/O only, no lock needed
     if (!get_cached_file(request.hash, cached_file)) {
         response.result = 0;
         return true;
     }
     size_t size = cached_file.size();
+
+    std::lock_guard<std::mutex> lock(backend_mutex);
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1302,10 +1554,17 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %zu, hash: %" PRIx64 "\n",
             __func__, (void*)tensor->buffer, tensor->data, request.offset, size, request.hash);
 
-    // sanitize tensor->data
+    // sanitize tensor->data — check for uint64 overflow before pointer arithmetic
     {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+        // Overflow guard: if data + offset wraps around uint64, reject immediately
+        if (request.offset > UINT64_MAX - request.tensor.data) {
+            GGML_LOG_ERROR("[%s] integer overflow: data=0x%" PRIx64 " + offset=%" PRIu64 " wraps\n",
+                           __func__, request.tensor.data, request.offset);
+            return false;
+        }
 
         if (request.tensor.data + request.offset < p0
          || request.tensor.data + request.offset >= p1
@@ -1320,7 +1579,146 @@ bool rpc_server::set_tensor_hash(const rpc_msg_set_tensor_hash_req & request, rp
     return true;
 }
 
+bool rpc_server::set_tensor_gguf(const rpc_msg_set_tensor_gguf_req & request, rpc_msg_set_tensor_gguf_rsp & response) {
+    response.result = 0;
+
+    if (gguf_path.empty()) {
+        LOG_DBG("[%s] no GGUF path configured\n", __func__);
+        return true;
+    }
+
+    // Ensure null-termination: request.tensor.name is a char[GGML_MAX_NAME] from
+    // the wire.  If a client fills all bytes with non-null characters, string
+    // functions (gguf_find_tensor, printf %s) will read past the buffer into
+    // adjacent struct fields.  Use strnlen + std::string to guarantee a safe copy.
+    const std::string tensor_name_str(request.tensor.name,
+                                       strnlen(request.tensor.name, GGML_MAX_NAME));
+    const char * tensor_name = tensor_name_str.c_str();
+
+    // Build GGUF index on first use.
+    // Protected by backend_mutex because multiple client threads (spawned via
+    // detached std::thread in the accept loop) share this rpc_server instance
+    // and can call set_tensor_gguf concurrently.  Without the lock, the
+    // check-then-init pattern on gguf_ctx races: two threads can both see
+    // !gguf_ctx as true, both call gguf_init_from_file, and the second reset()
+    // frees the first thread's context while it's still in use.
+    {
+        std::lock_guard<std::mutex> lock(backend_mutex);
+        if (!gguf_ctx) {
+            struct gguf_init_params gparams = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+            gguf_ctx.reset(gguf_init_from_file(gguf_path.c_str(), gparams));
+            if (!gguf_ctx) {
+                GGML_LOG_ERROR("[%s] failed to parse GGUF file: %s\n", __func__, gguf_path.c_str());
+                gguf_path.clear(); // don't try again
+                return true;
+            }
+            GGML_LOG_INFO("[%s] indexed GGUF file: %s (%" PRId64 " tensors)\n",
+                          __func__, gguf_path.c_str(), gguf_get_n_tensors(gguf_ctx.get()));
+        }
+    }
+
+    // Look up tensor in GGUF by name (gguf_ctx is immutable after init, safe without lock)
+    int64_t tensor_idx = gguf_find_tensor(gguf_ctx.get(), tensor_name);
+    if (tensor_idx < 0) {
+        LOG_DBG("[%s] tensor '%s' not found in GGUF\n", __func__, tensor_name);
+        return true;
+    }
+
+    size_t data_offset = gguf_get_data_offset(gguf_ctx.get()) + gguf_get_tensor_offset(gguf_ctx.get(), tensor_idx);
+
+    // Read from local GGUF file into a temporary buffer.  File I/O happens
+    // outside the backend_mutex to avoid blocking other threads during disk reads.
+    // Deserialize + tensor_set happen under the lock below.
+    size_t size = 0;
+    std::vector<uint8_t> data;
+
+    // Deserialize the tensor (needs backend_mutex because it accesses backend buffer state)
+    {
+        std::lock_guard<std::mutex> lock(backend_mutex);
+
+        struct ggml_init_params params {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_ptr { ggml_init(params) };
+        GGML_ASSERT(ctx_ptr != nullptr);
+        ggml_context * ctx = ctx_ptr.get();
+        ggml_tensor * tensor = deserialize_tensor(ctx, &request.tensor);
+        if (tensor == nullptr || tensor->buffer == nullptr) {
+            GGML_LOG_ERROR("[%s] error deserializing tensor '%s'\n", __func__, tensor_name);
+            return true;
+        }
+
+        size = ggml_nbytes(tensor);
+
+        // Sanitize tensor->data against buffer bounds — check for uint64 overflow first
+        {
+            const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
+            const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+            if (request.offset > UINT64_MAX - request.tensor.data) {
+                GGML_LOG_ERROR("[%s] integer overflow: data + offset wraps for tensor '%s'\n",
+                               __func__, tensor_name);
+                return true;
+            }
+
+            if (request.tensor.data + request.offset < p0
+             || request.tensor.data + request.offset >= p1
+             || size > (p1 - request.tensor.data - request.offset)) {
+                GGML_LOG_ERROR("[%s] tensor '%s' data out of buffer bounds\n", __func__, tensor_name);
+                return true;
+            }
+        }
+    }
+    // backend_mutex released — do file I/O without holding the lock
+
+    std::ifstream ifs(gguf_path, std::ios::binary);
+    if (!ifs.is_open()) {
+        GGML_LOG_ERROR("[%s] failed to open GGUF file: %s\n", __func__, gguf_path.c_str());
+        return true;
+    }
+
+    data.resize(size);
+    ifs.seekg(data_offset);
+    if (!ifs.good()) {
+        GGML_LOG_ERROR("[%s] failed to seek to offset %zu in GGUF file\n", __func__, data_offset);
+        return true;
+    }
+    ifs.read((char *)data.data(), size);
+    if ((size_t)ifs.gcount() != size) {
+        GGML_LOG_ERROR("[%s] short read for '%s': got %zu, expected %zu\n",
+                       __func__, tensor_name, (size_t)ifs.gcount(), size);
+        return true;
+    }
+
+    // Write tensor data to backend (needs lock)
+    {
+        std::lock_guard<std::mutex> lock(backend_mutex);
+
+        struct ggml_init_params params {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_ptr { ggml_init(params) };
+        GGML_ASSERT(ctx_ptr != nullptr);
+        ggml_tensor * tensor = deserialize_tensor(ctx_ptr.get(), &request.tensor);
+        if (tensor == nullptr || tensor->buffer == nullptr) {
+            GGML_LOG_ERROR("[%s] error re-deserializing tensor '%s' for write\n", __func__, tensor_name);
+            return true;
+        }
+
+        ggml_backend_tensor_set(tensor, data.data(), request.offset, size);
+    }
+
+    response.result = 1;
+    GGML_LOG_INFO("[%s] loaded '%s' (%zu bytes) from local GGUF\n", __func__, tensor_name, size);
+    return true;
+}
+
 bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
+    std::lock_guard<std::mutex> lock(backend_mutex);
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1356,6 +1754,7 @@ bool rpc_server::init_tensor(const rpc_msg_init_tensor_req & request) {
 }
 
 bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<uint8_t> & response) {
+    std::lock_guard<std::mutex> lock(backend_mutex);
     struct ggml_init_params params {
         /*.mem_size   =*/ ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1371,10 +1770,16 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
     }
     LOG_DBG("[%s] buffer: %p, data: %p, offset: %" PRIu64 ", size: %" PRIu64 "\n", __func__, (void*)tensor->buffer, tensor->data, request.offset, request.size);
 
-    // sanitize tensor->data
+    // sanitize tensor->data — check for uint64 overflow before pointer arithmetic
     {
         const size_t p0 = (size_t) ggml_backend_buffer_get_base(tensor->buffer);
         const size_t p1 = p0 + ggml_backend_buffer_get_size(tensor->buffer);
+
+        if (request.offset > UINT64_MAX - request.tensor.data) {
+            GGML_LOG_ERROR("[%s] integer overflow: data=0x%" PRIx64 " + offset=%" PRIu64 " wraps\n",
+                           __func__, request.tensor.data, request.offset);
+            return false;
+        }
 
         if (request.tensor.data + request.offset < p0 ||
             request.tensor.data + request.offset >= p1 ||
@@ -1391,6 +1796,7 @@ bool rpc_server::get_tensor(const rpc_msg_get_tensor_req & request, std::vector<
 }
 
 bool rpc_server::copy_tensor(const rpc_msg_copy_tensor_req & request, rpc_msg_copy_tensor_rsp & response) {
+    std::lock_guard<std::mutex> lock(backend_mutex);
     struct ggml_init_params params {
         /*.mem_size   =*/ 2*ggml_tensor_overhead(),
         /*.mem_buffer =*/ NULL,
@@ -1500,6 +1906,8 @@ bool rpc_server::graph_compute(const std::vector<uint8_t> & input) {
     if (device >= backends.size()) {
         return false;
     }
+
+    std::lock_guard<std::mutex> lock(backend_mutex);
     uint32_t n_nodes;
     memcpy(&n_nodes, src, sizeof(n_nodes));
     src += sizeof(n_nodes);
@@ -1562,6 +1970,7 @@ bool rpc_server::graph_recompute(const rpc_msg_graph_recompute_req & request) {
     if (device >= backends.size()) {
         return false;
     }
+    std::lock_guard<std::mutex> lock(backend_mutex);
     if (stored_graphs[device].graph == nullptr) {
         return false;
     }
@@ -1577,6 +1986,7 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     if (dev_id >= backends.size()) {
         return false;
     }
+    std::lock_guard<std::mutex> lock(backend_mutex);
     size_t free, total;
     ggml_backend_dev_t dev = ggml_backend_get_device(backends[dev_id]);
     ggml_backend_dev_memory(dev, &free, &total);
@@ -1586,15 +1996,229 @@ bool rpc_server::get_device_memory(const rpc_msg_get_device_memory_req & request
     return true;
 }
 
+bool rpc_server::register_peer(const rpc_msg_register_peer_req & request,
+                               rpc_msg_register_peer_rsp & response) {
+    // Extract endpoint, ensuring null-termination safety
+    std::string endpoint(request.endpoint,
+                         strnlen(request.endpoint, sizeof(request.endpoint)));
+
+    if (endpoint.empty()) {
+        GGML_LOG_ERROR("[%s] empty endpoint\n", __func__);
+        response.result = 0;
+        return true;
+    }
+
+    // Validate endpoint format: must contain ":" with non-empty host and port
+    size_t colon_pos = endpoint.find(':');
+    if (colon_pos == std::string::npos || colon_pos == 0 || colon_pos == endpoint.size() - 1) {
+        GGML_LOG_ERROR("[%s] invalid endpoint format: '%s'\n", __func__, endpoint.c_str());
+        response.result = 0;
+        return true;
+    }
+
+    // Cap the number of registered peers to prevent unbounded growth from a
+    // malicious client.  In practice, meshes have 2-8 nodes.  A limit of 64
+    // is generous while preventing abuse.  This also limits the SSRF surface:
+    // each registered peer is an endpoint this server will connect to on
+    // PUSH_TENSOR_TO_PEER, so capping peers caps outbound connection targets.
+    static constexpr size_t MAX_PEERS = 64;
+    if (peers.find(request.peer_id) == peers.end() && peers.size() >= MAX_PEERS) {
+        GGML_LOG_ERROR("[%s] peer registry full (%zu peers), rejecting peer_id=%u endpoint='%s'\n",
+                       __func__, peers.size(), request.peer_id, endpoint.c_str());
+        response.result = 0;
+        return true;
+    }
+
+    // Log at WARN level because peer registration causes this server to make
+    // outbound TCP connections to the registered endpoint on future
+    // PUSH_TENSOR_TO_PEER commands (SSRF surface).  On a private network this
+    // is expected, but the log makes it auditable.
+    GGML_LOG_WARN("[%s] registering peer_id=%u endpoint='%s' (server will connect to this address on tensor push)\n",
+                  __func__, request.peer_id, endpoint.c_str());
+
+    peer_info info;
+    info.endpoint = endpoint;
+    info.sock = nullptr;  // lazy connect in Phase 5
+
+    std::lock_guard<std::mutex> lock(backend_mutex);
+    peers[request.peer_id] = std::move(info);
+
+    response.result = 1;
+    return true;
+}
+
+socket_t * rpc_server::connect_to_peer(uint32_t peer_id) {
+    // All access to the peers map must be serialized.  Multiple client threads
+    // can call push_tensor_to_peer (which calls connect_to_peer) concurrently,
+    // and register_peer can modify the map from another thread.
+    // std::unordered_map is not thread-safe for concurrent read+write.
+    std::lock_guard<std::mutex> lock(backend_mutex);
+
+    auto it = peers.find(peer_id);
+    if (it == peers.end()) {
+        GGML_LOG_ERROR("[%s] unknown peer_id=%u\n", __func__, peer_id);
+        return nullptr;
+    }
+    peer_info & peer = it->second;
+
+    // If we already have a connection, reuse it
+    if (peer.sock != nullptr) {
+        return peer.sock.get();
+    }
+
+    // Parse endpoint into host:port
+    std::string host;
+    int port;
+    if (!parse_endpoint(peer.endpoint, host, port)) {
+        GGML_LOG_ERROR("[%s] failed to parse endpoint '%s' for peer %u\n",
+                       __func__, peer.endpoint.c_str(), peer_id);
+        return nullptr;
+    }
+
+    // Connect to the peer server
+    auto sock = socket_connect(host.c_str(), port);
+    if (sock == nullptr) {
+        GGML_LOG_ERROR("[%s] failed to connect to peer %u at %s\n",
+                       __func__, peer_id, peer.endpoint.c_str());
+        return nullptr;
+    }
+
+    // Perform HELLO handshake to verify protocol compatibility
+    if (!check_server_version(sock)) {
+        GGML_LOG_ERROR("[%s] version check failed with peer %u at %s\n",
+                       __func__, peer_id, peer.endpoint.c_str());
+        return nullptr;
+    }
+
+    peer.sock = std::move(sock);
+    return peer.sock.get();
+}
+
+bool rpc_server::push_tensor_to_peer(
+        const rpc_msg_push_tensor_to_peer_req & request,
+        rpc_msg_push_tensor_to_peer_rsp & response) {
+
+    response.result = 0;  // default to failure
+
+    // Validate request.size before allocating: reject unreasonable sizes to prevent
+    // OOM from a malicious or buggy client sending a crafted uint64_t.  4 GB is far
+    // beyond any single tensor transfer in practice (largest MoE expert tensors are
+    // ~200 MB).  The bounds check below will catch legitimate size mismatches, but
+    // this early cap prevents the allocation from even being attempted.
+    static constexpr uint64_t MAX_TENSOR_TRANSFER_BYTES = UINT64_C(4) * 1024 * 1024 * 1024;
+    if (request.size == 0 || request.size > MAX_TENSOR_TRANSFER_BYTES) {
+        GGML_LOG_ERROR("[%s] request.size=%" PRIu64 " is zero or exceeds %" PRIu64 " byte safety cap\n",
+                       __func__, request.size, MAX_TENSOR_TRANSFER_BYTES);
+        return true;
+    }
+
+    // --- Phase A: Read from local backend (LOCKED) ---
+    std::vector<uint8_t> staging_buffer(request.size);
+    {
+        std::lock_guard<std::mutex> lock(backend_mutex);
+
+        struct ggml_init_params params {
+            /*.mem_size   =*/ ggml_tensor_overhead(),
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context_ptr ctx_ptr { ggml_init(params) };
+        GGML_ASSERT(ctx_ptr != nullptr);
+        ggml_context * ctx = ctx_ptr.get();
+
+        ggml_tensor * src_tensor = deserialize_tensor(ctx, &request.src);
+        if (src_tensor == nullptr || src_tensor->buffer == nullptr) {
+            GGML_LOG_ERROR("[%s] error deserializing source tensor\n", __func__);
+            return true;
+        }
+
+        // Sanitize source tensor data region — check for uint64 overflow first
+        {
+            const size_t p0 = (size_t) ggml_backend_buffer_get_base(src_tensor->buffer);
+            const size_t p1 = p0 + ggml_backend_buffer_get_size(src_tensor->buffer);
+
+            if (request.offset > UINT64_MAX - request.src.data) {
+                GGML_LOG_ERROR("[%s] integer overflow: src.data=0x%" PRIx64 " + offset=%" PRIu64 " wraps\n",
+                               __func__, request.src.data, request.offset);
+                return true;
+            }
+
+            if (request.src.data + request.offset < p0 ||
+                request.src.data + request.offset >= p1 ||
+                request.size > (p1 - request.src.data - request.offset)) {
+                GGML_LOG_ERROR("[%s] source tensor region (data=0x%" PRIx64 ", offset=%" PRIu64 ", size=%" PRIu64 ") out of buffer bounds [0x%zx, 0x%zx)\n",
+                               __func__, request.src.data, request.offset, request.size, p0, p1);
+                return true;
+            }
+        }
+
+        ggml_backend_tensor_get(src_tensor, staging_buffer.data(),
+                                request.offset, request.size);
+    }
+    // backend_mutex is now released
+
+    // --- Phase B: Send to peer (UNLOCKED) ---
+    socket_t * peer_sock = connect_to_peer(request.peer_id);
+    if (peer_sock == nullptr) {
+        return true;  // response.result is already 0 (failure)
+    }
+
+    // Build the PEER_TENSOR_DATA payload using the same wire format as SET_TENSOR:
+    //   | rpc_tensor (dst) | offset (8 bytes) | data (size bytes) |
+    size_t payload_size = sizeof(rpc_tensor) + sizeof(uint64_t) + request.size;
+    std::vector<uint8_t> payload(payload_size);
+    size_t pos = 0;
+    memcpy(payload.data() + pos, &request.dst, sizeof(rpc_tensor));
+    pos += sizeof(rpc_tensor);
+    memcpy(payload.data() + pos, &request.offset, sizeof(uint64_t));
+    pos += sizeof(uint64_t);
+    memcpy(payload.data() + pos, staging_buffer.data(), request.size);
+
+    // Send the command to the peer using raw socket I/O
+    // Wire format: | cmd (1 byte) | payload_size (8 bytes) | payload |
+    // Then read:   | response_size (8 bytes) | response (1 byte) |
+    uint8_t cmd_byte = RPC_CMD_PEER_TENSOR_DATA;
+    if (!send_data(peer_sock->fd, &cmd_byte, sizeof(cmd_byte)) ||
+        !send_data(peer_sock->fd, &payload_size, sizeof(payload_size)) ||
+        !send_data(peer_sock->fd, payload.data(), payload.size())) {
+        GGML_LOG_ERROR("[%s] failed to send data to peer %u\n", __func__, request.peer_id);
+        {
+            std::lock_guard<std::mutex> lock(backend_mutex);
+            peers[request.peer_id].sock = nullptr;  // reset stale connection
+        }
+        return true;
+    }
+
+    // Read the response
+    uint64_t out_size;
+    uint8_t peer_result = 0;
+    if (!recv_data(peer_sock->fd, &out_size, sizeof(out_size)) ||
+        out_size != sizeof(peer_result) ||
+        !recv_data(peer_sock->fd, &peer_result, sizeof(peer_result))) {
+        GGML_LOG_ERROR("[%s] failed to receive response from peer %u\n", __func__, request.peer_id);
+        {
+            std::lock_guard<std::mutex> lock(backend_mutex);
+            peers[request.peer_id].sock = nullptr;  // reset stale connection
+        }
+        return true;
+    }
+
+    if (peer_result != 1) {
+        GGML_LOG_ERROR("[%s] peer %u rejected the tensor data\n", __func__, request.peer_id);
+        return true;
+    }
+
+    response.result = 1;
+    return true;
+}
+
 rpc_server::~rpc_server() {
     for (auto buffer : buffers) {
         ggml_backend_buffer_free(buffer);
     }
 }
 
-static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const char * cache_dir,
-                             sockfd_t sockfd) {
-    rpc_server server(backends, cache_dir);
+static void rpc_serve_client(rpc_server & server, sockfd_t sockfd) {
     uint8_t cmd;
     if (!recv_data(sockfd, &cmd, 1)) {
         return;
@@ -1631,7 +2255,7 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                     return;
                 }
                 rpc_msg_device_count_rsp response;
-                response.device_count = backends.size();
+                response.device_count = server.get_n_backends();
                 if (!send_msg(sockfd, &response, sizeof(response))) {
                     return;
                 }
@@ -1832,6 +2456,62 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
                 }
                 break;
             }
+            case RPC_CMD_SET_TENSOR_GGUF: {
+                rpc_msg_set_tensor_gguf_req request;
+                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_set_tensor_gguf_rsp response;
+                if (!server.set_tensor_gguf(request, response)) {
+                    return;
+                }
+                if (!send_msg(sockfd, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_REGISTER_PEER: {
+                rpc_msg_register_peer_req request;
+                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_register_peer_rsp response = {};
+                if (!server.register_peer(request, response)) {
+                    return;
+                }
+                if (!send_msg(sockfd, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_PUSH_TENSOR_TO_PEER: {
+                rpc_msg_push_tensor_to_peer_req request;
+                if (!recv_msg(sockfd, &request, sizeof(request))) {
+                    return;
+                }
+                rpc_msg_push_tensor_to_peer_rsp response = {};
+                if (!server.push_tensor_to_peer(request, response)) {
+                    return;
+                }
+                if (!send_msg(sockfd, &response, sizeof(response))) {
+                    return;
+                }
+                break;
+            }
+            case RPC_CMD_PEER_TENSOR_DATA: {
+                // Wire format is identical to RPC_CMD_SET_TENSOR:
+                // | rpc_tensor | offset (8 bytes) | data (N bytes) |
+                // Reuse the set_tensor handler
+                std::vector<uint8_t> input;
+                if (!recv_msg(sockfd, input)) {
+                    return;
+                }
+                uint8_t result = server.set_tensor(input) ? 1 : 0;
+                if (!send_msg(sockfd, &result, sizeof(result))) {
+                    return;
+                }
+                break;
+            }
             default: {
                 GGML_LOG_ERROR("Unknown command: %d\n", cmd);
                 return;
@@ -1840,8 +2520,9 @@ static void rpc_serve_client(const std::vector<ggml_backend_t> & backends, const
     }
 }
 
-void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
-                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+static void rpc_start_server_impl(const char * endpoint, const char * cache_dir,
+                                  size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                  const char * gguf_path) {
     if (n_devices == 0 || devices == nullptr) {
         fprintf(stderr, "Invalid arguments to ggml_backend_rpc_start_server\n");
         return;
@@ -1853,6 +2534,7 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         RPC_PROTO_PATCH_VERSION);
     printf("  endpoint       : %s\n", endpoint);
     printf("  local cache    : %s\n", cache_dir ? cache_dir : "n/a");
+    printf("  local GGUF     : %s\n", gguf_path ? gguf_path : "n/a");
     printf("Devices:\n");
     for (size_t i = 0; i < n_devices; i++) {
         auto dev = devices[i];
@@ -1895,17 +2577,38 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
         fprintf(stderr, "Failed to create server socket\n");
         return;
     }
+
+    rpc_server server(backends, cache_dir);
+    server.set_gguf_path(gguf_path);
+
     while (true) {
         auto client_socket = socket_accept(server_socket->fd);
         if (client_socket == nullptr) {
             fprintf(stderr, "Failed to accept client connection\n");
-            return;
+            continue;
         }
         printf("Accepted client connection\n");
         fflush(stdout);
-        rpc_serve_client(backends, cache_dir, client_socket->fd);
-        printf("Client connection closed\n");
-        fflush(stdout);
+
+        // Transfer fd ownership from the socket_t RAII wrapper to the thread.
+        // Setting fd to an invalid value prevents the destructor from closing it.
+        sockfd_t fd = client_socket->fd;
+#ifdef _WIN32
+        client_socket->fd = INVALID_SOCKET;
+#else
+        client_socket->fd = -1;
+#endif
+
+        std::thread([&server, fd]() {
+            rpc_serve_client(server, fd);
+#ifdef _WIN32
+            closesocket(fd);
+#else
+            close(fd);
+#endif
+            printf("Client connection closed\n");
+            fflush(stdout);
+        }).detach();
     }
 #ifdef _WIN32
     WSACleanup();
@@ -1913,6 +2616,17 @@ void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir
     for (auto backend : backends) {
         ggml_backend_free(backend);
     }
+}
+
+void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
+                                   size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices) {
+    rpc_start_server_impl(endpoint, cache_dir, n_threads, n_devices, devices, nullptr);
+}
+
+void ggml_backend_rpc_start_server_with_gguf(const char * endpoint, const char * cache_dir,
+                                              size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                              const char * gguf_path) {
+    rpc_start_server_impl(endpoint, cache_dir, n_threads, n_devices, devices, gguf_path);
 }
 
 // device interface
@@ -2046,6 +2760,9 @@ static void * ggml_backend_rpc_get_proc_address(ggml_backend_reg_t reg, const ch
     if (std::strcmp(name, "ggml_backend_rpc_start_server") == 0) {
         return (void *)ggml_backend_rpc_start_server;
     }
+    if (std::strcmp(name, "ggml_backend_rpc_start_server_with_gguf") == 0) {
+        return (void *)ggml_backend_rpc_start_server_with_gguf;
+    }
     return NULL;
 
     GGML_UNUSED(reg);
@@ -2091,6 +2808,7 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
     static std::unordered_map<std::string, ggml_backend_reg_t> reg_map;
     static std::mutex mutex;
     static uint32_t dev_id = 0;
+    static uint32_t next_peer_id = 0;
     std::lock_guard<std::mutex> lock(mutex);
     if (reg_map.find(endpoint) != reg_map.end()) {
         return reg_map[endpoint];
@@ -2099,6 +2817,58 @@ ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint) {
     if (dev_count == 0) {
         return nullptr;
     }
+
+    // Assign a peer_id for this endpoint
+    uint32_t peer_id = next_peer_id++;
+
+    // Determine if this server supports peer registration (minor version >= 7)
+    uint8_t new_server_minor = 0;
+    {
+        std::lock_guard<std::mutex> mv_lock(rpc_server_minor_versions_mutex);
+        auto mv_it = rpc_server_minor_versions.find(endpoint);
+        if (mv_it != rpc_server_minor_versions.end()) {
+            new_server_minor = mv_it->second;
+        }
+    }
+    bool new_supports_peers = (new_server_minor >= 7);
+
+    if (!new_supports_peers) {
+        GGML_LOG_INFO("rpc: server %s has protocol minor version %u, "
+                      "direct server-to-server transfers not available\n",
+                      endpoint, (unsigned)new_server_minor);
+    }
+
+    // Cross-register peers: inform existing servers about this one and vice versa
+    {
+        std::lock_guard<std::mutex> srv_lock(rpc_servers_mutex);
+        if (new_supports_peers) {
+            auto new_sock = get_socket(endpoint);
+            if (new_sock) {
+                for (const auto & existing : rpc_servers) {
+                    // Register existing server as peer on the new server
+                    if (!send_register_peer(new_sock, existing.peer_id, existing.endpoint.c_str())) {
+                        GGML_LOG_ERROR("[%s] failed to register peer %u (%s) on new server %s\n",
+                                       __func__, existing.peer_id, existing.endpoint.c_str(), endpoint);
+                    }
+
+                    // Register new server as peer on existing server (if it supports peers)
+                    if (existing.server_minor_version >= 7) {
+                        auto existing_sock = get_socket(existing.endpoint);
+                        if (existing_sock) {
+                            if (!send_register_peer(existing_sock, peer_id, endpoint)) {
+                                GGML_LOG_ERROR("[%s] failed to register peer %u (%s) on existing server %s\n",
+                                               __func__, peer_id, endpoint, existing.endpoint.c_str());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Add this server to the global list
+        rpc_servers.push_back({endpoint, peer_id, new_server_minor});
+    }
+
     ggml_backend_rpc_reg_context * ctx = new ggml_backend_rpc_reg_context;
     ctx->name = "RPC[" + std::string(endpoint) + "]";
     for (uint32_t ind = 0; ind < dev_count; ind++) {

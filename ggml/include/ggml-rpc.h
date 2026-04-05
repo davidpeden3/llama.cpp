@@ -7,8 +7,8 @@ extern "C" {
 #endif
 
 #define RPC_PROTO_MAJOR_VERSION    3
-#define RPC_PROTO_MINOR_VERSION    6
-#define RPC_PROTO_PATCH_VERSION    1
+#define RPC_PROTO_MINOR_VERSION    7
+#define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
 static_assert(GGML_OP_COUNT == 96, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
@@ -26,6 +26,11 @@ GGML_BACKEND_API void ggml_backend_rpc_get_device_memory(const char * endpoint, 
 
 GGML_BACKEND_API void ggml_backend_rpc_start_server(const char * endpoint, const char * cache_dir,
                                                     size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices);
+
+// Start server with a local GGUF file — tensors are loaded from disk instead of over the wire
+GGML_BACKEND_API void ggml_backend_rpc_start_server_with_gguf(const char * endpoint, const char * cache_dir,
+                                                               size_t n_threads, size_t n_devices, ggml_backend_dev_t * devices,
+                                                               const char * gguf_path);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_reg(void);
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_rpc_add_server(const char * endpoint);

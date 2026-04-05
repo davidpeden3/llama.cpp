@@ -8172,6 +8172,13 @@ ggml_backend_dev_t llama_model::dev_output() const {
 
 template<typename F>
 static bool buft_supported(ggml_backend_buffer_type_t buft, ggml_backend_dev_t dev, F & fn) {
+    // RPC backends always report supports_op=true, so skip the expensive
+    // alloc_buffer(0) round-trips over the network
+    const char * buft_name = ggml_backend_buft_name(buft);
+    if (buft_name && strncmp(buft_name, "RPC", 3) == 0) {
+        return true;
+    }
+
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead()*8,
         /*.mem_buffer =*/ NULL,
@@ -9275,6 +9282,22 @@ const char * llama_model_chat_template(const llama_model * model, const char * n
 
 uint64_t llama_model_n_params(const llama_model * model) {
     return model->n_elements();
+}
+
+int32_t llama_model_set_expert_mask(llama_model * model, const bool * mask, int32_t n_mask) {
+    if (mask == nullptr) {
+        model->hparams.expert_mask_enabled = false;
+        memset(model->hparams.expert_mask, 0, sizeof(model->hparams.expert_mask));
+        return 0;
+    }
+    if ((uint32_t)n_mask != model->hparams.n_expert) {
+        return -1;
+    }
+    model->hparams.expert_mask_enabled = true;
+    for (int i = 0; i < n_mask; i++) {
+        model->hparams.expert_mask[i] = mask[i];
+    }
+    return 0;
 }
 
 bool llama_model_has_encoder(const llama_model * model) {
