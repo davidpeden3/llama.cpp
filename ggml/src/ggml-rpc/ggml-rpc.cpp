@@ -2010,6 +2010,12 @@ bool rpc_server::register_peer(const rpc_msg_register_peer_req & request,
 }
 
 socket_t * rpc_server::connect_to_peer(uint32_t peer_id) {
+    // All access to the peers map must be serialized.  Multiple client threads
+    // can call push_tensor_to_peer (which calls connect_to_peer) concurrently,
+    // and register_peer can modify the map from another thread.
+    // std::unordered_map is not thread-safe for concurrent read+write.
+    std::lock_guard<std::mutex> lock(backend_mutex);
+
     auto it = peers.find(peer_id);
     if (it == peers.end()) {
         GGML_LOG_ERROR("[%s] unknown peer_id=%u\n", __func__, peer_id);
@@ -2132,7 +2138,10 @@ bool rpc_server::push_tensor_to_peer(
         !send_data(peer_sock->fd, &payload_size, sizeof(payload_size)) ||
         !send_data(peer_sock->fd, payload.data(), payload.size())) {
         GGML_LOG_ERROR("[%s] failed to send data to peer %u\n", __func__, request.peer_id);
-        peers[request.peer_id].sock = nullptr;  // reset stale connection
+        {
+            std::lock_guard<std::mutex> lock(backend_mutex);
+            peers[request.peer_id].sock = nullptr;  // reset stale connection
+        }
         return true;
     }
 
@@ -2143,7 +2152,10 @@ bool rpc_server::push_tensor_to_peer(
         out_size != sizeof(peer_result) ||
         !recv_data(peer_sock->fd, &peer_result, sizeof(peer_result))) {
         GGML_LOG_ERROR("[%s] failed to receive response from peer %u\n", __func__, request.peer_id);
-        peers[request.peer_id].sock = nullptr;  // reset stale connection
+        {
+            std::lock_guard<std::mutex> lock(backend_mutex);
+            peers[request.peer_id].sock = nullptr;  // reset stale connection
+        }
         return true;
     }
 
