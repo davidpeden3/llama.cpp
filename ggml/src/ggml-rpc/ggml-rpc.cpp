@@ -1587,7 +1587,13 @@ bool rpc_server::set_tensor_gguf(const rpc_msg_set_tensor_gguf_req & request, rp
         return true;
     }
 
-    const char * tensor_name = request.tensor.name;
+    // Ensure null-termination: request.tensor.name is a char[GGML_MAX_NAME] from
+    // the wire.  If a client fills all bytes with non-null characters, string
+    // functions (gguf_find_tensor, printf %s) will read past the buffer into
+    // adjacent struct fields.  Use strnlen + std::string to guarantee a safe copy.
+    const std::string tensor_name_str(request.tensor.name,
+                                       strnlen(request.tensor.name, GGML_MAX_NAME));
+    const char * tensor_name = tensor_name_str.c_str();
 
     // Build GGUF index on first use.
     // Protected by backend_mutex because multiple client threads (spawned via
