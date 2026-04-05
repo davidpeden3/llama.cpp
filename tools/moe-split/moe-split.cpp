@@ -723,6 +723,18 @@ int main(int argc, const char ** argv) {
                 (int)ranking.size(), n_expert);
         }
 
+        // Validate all expert IDs from the ranking file are within model range.
+        // Without this check, an out-of-range expert ID would be used to compute
+        // a file seek offset (expert_id * bytes_per_expert), reading past the
+        // model's tensor data and producing a corrupted shard.
+        for (const auto & r : ranking) {
+            if (r.first < 0 || r.first >= n_expert) {
+                fprintf(stderr, "error: ranking file contains expert ID %d, but model has %d experts [0, %d)\n",
+                    r.first, n_expert, n_expert);
+                return 1;
+            }
+        }
+
         // Identify experts to replicate (they go in EVERY group)
         std::set<int> replicated;
         for (int i = 0; i < params.replicate && i < (int)ranking.size(); i++) {
